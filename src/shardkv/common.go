@@ -1,5 +1,9 @@
 package shardkv
 
+import (
+	"time"
+)
+
 //
 // Sharded key/value server.
 // Lots of replica groups, each running Raft.
@@ -14,31 +18,28 @@ const (
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
+	// my definition
+	Put               = "Put"
+	Append            = "Append"
+	Get               = "Get"
+	ResultCheckTime   = 2 * time.Millisecond
+	ReConfigCheckTime = 100 * time.Millisecond
 )
 
 type Err string
 
-// Put or Append
-type PutAppendArgs struct {
-	// You'll have to add definitions here.
+type OpArgs struct {
 	Key   string
 	Value string
-	Op    string // "Put" or "Append"
-	// You'll have to add definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Op    string
+	// my definition
+	Shard       int
+	ClientID    int64
+	SequenceNum int
 }
 
-type PutAppendReply struct {
+type OpReply struct {
 	Err Err
-}
-
-type GetArgs struct {
-	Key string
-	// You'll have to add definitions here.
-}
-
-type GetReply struct {
-	Err   Err
+	// for 'Get'
 	Value string
 }

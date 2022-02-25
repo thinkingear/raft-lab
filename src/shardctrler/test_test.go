@@ -181,7 +181,7 @@ func TestBasic(t *testing.T) {
 	fmt.Printf("  ... Passed\n")
 
 	fmt.Printf("Test: Concurrent leave/join ...\n")
-
+	Debug = false
 	const npara = 10
 	var cka [npara]*Clerk
 	for i := 0; i < len(cka); i++ {

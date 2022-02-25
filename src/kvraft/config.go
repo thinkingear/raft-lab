@@ -307,6 +307,7 @@ func (cfg *config) StartServer(i int) {
 	// the last persisted state.
 	if cfg.saved[i] != nil {
 		cfg.saved[i] = cfg.saved[i].Copy()
+		//fmt.Printf("snapshot[%v] size: %v\n", i, cfg.saved[i].SnapshotSize())
 	} else {
 		cfg.saved[i] = raft.MakePersister()
 	}

@@ -1,18 +1,15 @@
 package shardkv
 
-
-import "6.824/labrpc"
+import (
+	"6.824/labrpc"
+	"6.824/shardctrler"
+	"bytes"
+	"log"
+	"time"
+)
 import "6.824/raft"
 import "sync"
 import "6.824/labgob"
-
-
-
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-}
 
 type ShardKV struct {
 	mu           sync.Mutex
@@ -25,15 +22,116 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	persister      *raft.Persister
+	stateMachines  [shardctrler.NShards]StateMachine
+	shardLocks     [shardctrler.NShards]sync.Mutex
+	requestResults map[int64]RequestResult
+	lastConfig     shardctrler.Config
 }
 
-
-func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+type StateMachine struct {
+	Shard int
+	Owned bool
+	KVMap map[string]string
 }
 
-func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+type RequestResult struct {
+	SequenceNum int
+	OpReply     OpReply
+}
+
+func (kv *ShardKV) Operation(args *OpArgs, reply *OpReply) {
+	// Acquire the corresponding shard's lock first if you owned it,
+	// else reject this request
+	shard := args.Shard
+	kv.shardLocks[shard].Lock()
+	defer kv.shardLocks[shard].Unlock()
+
+	if !kv.stateMachines[shard].Owned {
+		reply.Err = ErrWrongGroup
+	}
+
+	clientID, sequenceNum := args.ClientID, args.SequenceNum
+
+	if _, exist := kv.requestResults[clientID]; !exist {
+		kv.requestResults[clientID] = RequestResult{}
+	}
+
+	if kv.requestResults[clientID].SequenceNum == sequenceNum {
+		*reply = kv.requestResults[clientID].OpReply
+		return
+	}
+
+	_, term, isLeader := kv.rf.Start(*args)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	for kv.requestResults[clientID].SequenceNum != sequenceNum {
+		kv.shardLocks[shard].Unlock()
+		time.Sleep(ResultCheckTime)
+		kv.shardLocks[shard].Lock()
+		// has the KVServer's state been stale?
+		if currentTerm, _ := kv.rf.GetState(); currentTerm != term {
+			reply.Err = ErrWrongLeader
+			return
+		} else if !kv.stateMachines[shard].Owned {
+			reply.Err = ErrWrongGroup
+			return
+		}
+	}
+
+	*reply = kv.requestResults[clientID].OpReply
+}
+
+func (kv *ShardKV) takeSnapshot(commandIndex int) {
+	if kv.maxraftstate != -1 && kv.maxraftstate <= kv.persister.RaftStateSize() {
+		for i := 0; i < len(kv.shardLocks); i++ {
+			kv.shardLocks[i].Lock()
+			defer kv.shardLocks[i].Unlock()
+		}
+
+		w := new(bytes.Buffer)
+		e := labgob.NewEncoder(w)
+		e.Encode(kv.stateMachines)
+		e.Encode(kv.requestResults)
+		kv.rf.Snapshot(commandIndex, w.Bytes())
+	}
+}
+
+func (kv *ShardKV) applySnapshot(snapshot []byte) {
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	if d.Decode(&kv.stateMachines) != nil ||
+		d.Decode(&kv.requestResults) != nil {
+		log.Fatalf("decode error\n")
+	} else {
+		//DPrintf("Recover from Snapshot size: %v", kv.persister.SnapshotSize())
+		//DPrintf("Recover from Snapshot: %v", stateMachine)
+	}
+}
+
+func (kv *ShardKV) procOperation() {
+
+}
+
+func (kv *ShardKV) applier() {
+	for m := range kv.applyCh {
+		if m.SnapshotValid {
+			kv.applySnapshot(m.Snapshot)
+		} else if m.CommandValid {
+
+			kv.takeSnapshot(m.CommandIndex)
+		} else {
+			// do nothing
+		}
+	}
+}
+
+func (kv *ShardKV) mkEnd(string2 string) *labrpc.ClientEnd {
+	return kv.make_end(string2)
 }
 
 //
@@ -46,7 +144,6 @@ func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
 }
-
 
 //
 // servers[] contains the ports of the servers in this group.
@@ -79,7 +176,7 @@ func (kv *ShardKV) Kill() {
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
+	labgob.Register(OpArgs{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -89,6 +186,14 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.ctrlers = ctrlers
 
 	// Your initialization code here.
+	kv.persister = persister
+
+	for shard := 0; shard < shardctrler.NShards; shard++ {
+		kv.stateMachines[shard].KVMap = make(map[string]string)
+		kv.stateMachines[shard].Shard = shard
+	}
+
+	kv.requestResults = make(map[int64]RequestResult)
 
 	// Use something like this to talk to the shardctrler:
 	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
@@ -96,6 +201,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	go kv.checkReConfig()
+	go kv.applier()
 
 	return kv
 }

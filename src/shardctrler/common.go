@@ -1,5 +1,11 @@
 package shardctrler
 
+import (
+	"fmt"
+	"log"
+	"time"
+)
+
 //
 // Shard controler: assigns shards to replication groups.
 //
@@ -28,46 +34,62 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+var Debug bool = false
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		log.Printf(format, a...)
+		fmt.Println()
+	}
+	return
+}
+
 const (
-	OK = "OK"
+	OK        = "OK"
+	CheckTime = 2 * time.Millisecond
+	JOIN      = 1
+	LEAVE     = 2
+	MOVE      = 3
+	QUERY     = 4
 )
+
+func type2str(opType int) string {
+	var res string
+	switch opType {
+	case JOIN:
+		res = "Join"
+	case LEAVE:
+		res = "Leave"
+	case MOVE:
+		res = "Move"
+	case QUERY:
+		res = "Query"
+	}
+	return res
+}
 
 type Err string
 
-type JoinArgs struct {
+type ConfigArgs struct {
+	// For all
+	ClientID    int64
+	SequenceNum int
+	Type        int
+	// Join
 	Servers map[int][]string // new GID -> servers mappings
-}
-
-type JoinReply struct {
-	WrongLeader bool
-	Err         Err
-}
-
-type LeaveArgs struct {
+	// Leave
 	GIDs []int
-}
-
-type LeaveReply struct {
-	WrongLeader bool
-	Err         Err
-}
-
-type MoveArgs struct {
+	// Move
 	Shard int
 	GID   int
-}
-
-type MoveReply struct {
-	WrongLeader bool
-	Err         Err
-}
-
-type QueryArgs struct {
+	// Query
 	Num int // desired config number
 }
 
-type QueryReply struct {
+type ConfigReply struct {
+	// For all
 	WrongLeader bool
 	Err         Err
-	Config      Config
+	// Query
+	Config Config
 }

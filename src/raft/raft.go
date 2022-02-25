@@ -8,31 +8,36 @@ package raft
 // rf = Make(...)
 //   create a new Raft server.
 // rf.Start(command interface{}) (index, term, isleader)
-//   start agreement on a new log entry
+//   start agreement on a new Log entry
 // rf.GetState() (term, isLeader)
 //   ask a Raft for its current term, and whether it thinks it is leader
 // ApplyMsg
-//   each time a new entry is committed to the log, each Raft peer
+//   each time a new entry is committed to the Log, each Raft peer
 //   should send an ApplyMsg to the service (or tester)
 //   in the same server.
 //
 
 import (
-//	"bytes"
+	"6.824/labgob"
+	"bytes"
+	"log"
+	"math/rand"
+
+	//	"bytes"
 	"sync"
 	"sync/atomic"
+	"time"
 
-//	"6.824/labgob"
+	//	"6.824/labgob"
 	"6.824/labrpc"
 )
 
-
 //
-// as each Raft peer becomes aware that successive log entries are
+// as each Raft peer becomes aware that successive Log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
 // CommandValid to true to indicate that the ApplyMsg contains a newly
-// committed log entry.
+// committed Log entry.
 //
 // in part 2D you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh, but set CommandValid to false for these
@@ -50,6 +55,22 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+const (
+	Follower  = 1
+	Candidate = 2
+	Leader    = 3
+)
+
+type Entry struct {
+	CMD  interface{}
+	Term int
+}
+
+type Applicant struct {
+	applierCond *sync.Cond
+	applyCh     chan ApplyMsg
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -64,15 +85,44 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// My State
+	status       int
+	electionTime time.Time // when election timeout
+	applicant    Applicant
+	snapshot     Snapshot
+	hasSnap      bool
+
+	// Paper Figure 2:
+	// Persistent state on all servers
+	// Updated on stable storage before responding to RPCs
+	CurrentTerm int // lasted term server has been
+	VotedFor    int // candidateId that received vote in current term
+	Log         Log // Log entries; each entry contains command for sate machine, and term when entry was received by leader (first index id 1)
+
+	// Volatile state on all servers
+	// Reinitialized after each election
+	commitIndex int // index of highest Log entry known to be committed (initialized to 0)
+	lastApplied int // index of highest Log entry applied to state machine (initialized to 0)
+
+	// Volatile state on leaders
+	nextIndex  []int // for each server, index of the next Log entry to send to that server (initialized to 1 + leader's last Log index)
+	matchIndex []int // for each server, index of highest Log entry known to be replicated on server
 }
 
-// return currentTerm and whether this server
+// return CurrentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	var term int
 	var isleader bool
 	// Your code here (2A).
+
+	term = rf.CurrentTerm
+	isleader = rf.status == Leader
+
 	return term, isleader
 }
 
@@ -84,14 +134,17 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(rf.CurrentTerm) != nil ||
+		e.Encode(rf.VotedFor) != nil ||
+		e.Encode(rf.Log) != nil {
+		log.Fatalf("S%v persist failed", rf.me)
+	}
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+	Debug(dPersist, "raft: S%v persist curTerm %v, votedFor S%v, log.start %v, log.lastIdx %v", rf.me, rf.CurrentTerm, rf.VotedFor, rf.Log.start(), rf.Log.lastIndex())
 }
-
 
 //
 // restore previously persisted state.
@@ -102,40 +155,25 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var CurrentTerm int
+	var VotedFor int
+	var Log Log
+	if d.Decode(&CurrentTerm) != nil ||
+		d.Decode(&VotedFor) != nil || d.Decode(&Log) != nil {
+		Debug(dPersist, "S%v read persist failed", rf.me)
+		//   error...
+		log.Fatalf("raft: S%v read persist failed", rf.me)
+	} else {
+		rf.CurrentTerm = CurrentTerm
+		rf.VotedFor = VotedFor
+		rf.Log = Log
+		Debug(dPersist, "S%v read persist curTerm %v, votedFor S%v, log.start %v, log.lastIdx %v", rf.me, CurrentTerm, VotedFor, Log.start(), Log.lastIndex())
+		rf.lastApplied = rf.Log.start()
+		rf.commitIndex = rf.Log.start()
+	}
 }
-
-
-//
-// A service wants to switch to snapshot.  Only do so if Raft hasn't
-// have more recent info since it communicate the snapshot on applyCh.
-//
-func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
-	// Your code here (2D).
-
-	return true
-}
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
-
-}
-
 
 //
 // example RequestVote RPC arguments structure.
@@ -143,6 +181,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+
+	Term         int // candidate's term
+	CandidateId  int // candidate requesting vote
+	LastLogIndex int // index of candidate's last Log entry
+	LastLogTerm  int // term of candidate's last Log entry
 }
 
 //
@@ -151,6 +194,53 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+
+	Term        int  // curretnTerm, for candidate to update itself
+	VoteGranted bool // true means candidate received vote
+}
+
+type AppendEntriesArgs struct {
+	Term         int     // leader's term
+	LeaderId     int     // so follower can redirect clients
+	PrevLogIndex int     // index of Log entry immediately preceding new ones
+	PrevLogTerm  int     // term of prevLogIndex entry
+	Entries      []Entry // Log entries to store (empty for hearbeat; may send more than one for efficiency)
+	LeaderCommit int     // leader's commitIndex
+}
+
+type AppendEntriesReply struct {
+	Term    int  // CurrentTerm, for leader to update itself
+	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+
+	// fast backup
+	ConflictTerm  int
+	ConflictIndex int
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	Debug(dTerm, "S%v <- S%v AE: %v", rf.me, args.LeaderId, args)
+
+	if args.Term > rf.CurrentTerm {
+		rf.newTermL(args.Term, args.LeaderCommit)
+	}
+
+	if args.Term < rf.CurrentTerm {
+		Debug(dTerm, "S%d <- S%v AE rejected: old AE", rf.me, args.LeaderCommit)
+	} else {
+		rf.consistencyCheckL(args, reply)
+		rf.resetElectionTimeL(false)
+	}
+
+	reply.Term = rf.CurrentTerm
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
 }
 
 //
@@ -158,6 +248,34 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	Debug(dTerm, "S%v <- S%v RV: %v", rf.me, args.CandidateId, args)
+
+	myLastEntry := rf.Log.at(rf.Log.lastIndex())
+	uptodate := (args.LastLogTerm > myLastEntry.Term) || (args.LastLogTerm == myLastEntry.Term && args.LastLogIndex >= rf.Log.lastIndex())
+
+	if args.Term > rf.CurrentTerm {
+		rf.newTermL(args.Term, args.CandidateId)
+	}
+
+	if args.Term < rf.CurrentTerm {
+		Debug(dTerm, "S%v <- S%v RV rejected: old RV", rf.me, args.CandidateId)
+		reply.VoteGranted = false
+	} else if (rf.VotedFor == -1 || rf.VotedFor == args.CandidateId) && uptodate {
+		Debug(dTerm, "S%v -> S%v vote", rf.me, args.CandidateId)
+		rf.VotedFor = args.CandidateId
+		rf.persist()
+		reply.VoteGranted = true
+		reply.Term = rf.CurrentTerm
+		rf.resetElectionTimeL(false)
+	} else {
+		Debug(dTerm, "S%v <- S%v RV rejected: update or has voted", rf.me, args.CandidateId)
+		reply.VoteGranted = false
+	}
+
+	reply.Term = rf.CurrentTerm
 }
 
 //
@@ -194,13 +312,12 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
+// agreement on the next command to be appended to Raft's Log. if this
 // server isn't the leader, returns false. otherwise start the
 // agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
+// command will ever be committed to the Raft Log, since the leader
 // may fail or lose an election. even if the Raft instance has been killed,
 // this function should return gracefully.
 //
@@ -210,12 +327,22 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	index := -1
+	term := rf.CurrentTerm
+	isLeader := rf.status == Leader
+
+	if isLeader {
+		rf.Log.append(Entry{CMD: command, Term: term})
+		index = rf.Log.lastIndex()
+		Debug(dClient, "S%v new log[%v] = %v",
+			rf.me, rf.Log.lastIndex(), rf.Log.at((rf.Log.lastIndex())))
+		rf.persist()
+		rf.sendAppendsL()
+	}
 
 	return index, term, isLeader
 }
@@ -234,11 +361,30 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	Debug(dDrop, "S%v %v killed", rf.me, Status2Str(rf.status))
 }
 
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
+}
+
+func (rf *Raft) tick() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	Debug(dTimer, "S%v term %v %v ticking: cmtIdx %v, lStart %v, lEnd %v",
+		rf.me, rf.CurrentTerm, Status2Str(rf.status), rf.commitIndex, rf.Log.start(), rf.Log.lastIndex())
+
+	if rf.status == Leader && time.Now().After(rf.electionTime) {
+		rf.sendAppendsL()
+	}
+
+	if rf.status != Leader && time.Now().After(rf.electionTime) {
+		rf.startElectionL()
+	}
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -250,6 +396,8 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 
+		time.Sleep(5 * time.Millisecond)
+		rf.tick()
 	}
 }
 
@@ -272,13 +420,27 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.status = Follower
+	rf.VotedFor = -1
+	rf.applicant.applyCh = applyCh
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
+	rf.Log = mkEmptyLog()
+	rf.applicant.applierCond = sync.NewCond(&rf.mu)
+	rand.Seed(int64(me))
+
+	Debug(dClient, "S%d built", rf.me)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.readSnapshot(persister.ReadSnapshot())
+	rf.lastApplied = rf.Log.start()
+	rf.commitIndex = rf.Log.start()
 
 	// start ticker goroutine to start elections
+	rf.resetElectionTimeL(false)
+	go rf.applier()
 	go rf.ticker()
-
 
 	return rf
 }
